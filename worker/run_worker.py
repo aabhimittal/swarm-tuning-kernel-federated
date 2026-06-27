@@ -5,10 +5,13 @@ Examples
     # against a local server
     python -m worker.run_worker --server http://localhost:7860 --worker-id w0 --steps 50
 
-    # against a live Hugging Face Space, as one shard of a 4-way split
+    # against a live Hugging Face Space, as one shard of a 4-way split.
+    # NOTE: use --token=VALUE (the '=' form) or the SWARM_TOKEN env var — a bare
+    # "--token VALUE" breaks if the token starts with '-' (argparse reads it as a flag).
+    export SWARM_TOKEN=...   # or pass --token="$SWARM_TOKEN"
     python -m worker.run_worker \
         --server https://USER-swarm-server.hf.space \
-        --worker-id kaggle-1 --shard 0 --num-shards 4 --steps 200 --token "$SWARM_TOKEN"
+        --worker-id kaggle-1 --shard 0 --num-shards 4 --steps 200
 """
 
 from __future__ import annotations
@@ -31,7 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--shard", type=int, default=0, help="This worker's data shard index.")
     p.add_argument("--num-shards", type=int, default=1, help="Total number of data shards.")
-    p.add_argument("--token", default=os.environ.get("SWARM_TOKEN", ""))
+    p.add_argument(
+        "--token",
+        default=os.environ.get("SWARM_TOKEN", ""),
+        help="Bearer token for the Space. Prefer the SWARM_TOKEN env var, or the "
+        "--token=VALUE form — a token starting with '-' breaks bare '--token VALUE'.",
+    )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--quiet", action="store_true")
     return p
