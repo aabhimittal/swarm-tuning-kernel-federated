@@ -38,6 +38,13 @@ def main() -> None:
     p.add_argument("--repo-id", required=True, help="e.g. your-username/swarm-server")
     p.add_argument("--token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
     p.add_argument("--private", action="store_true", help="Create the Space as private.")
+    p.add_argument(
+        "--skip-create",
+        action="store_true",
+        help="Upload to an existing Space without calling create_repo. Use when the "
+        "repo already exists but repo creation is refused (e.g. HF returns 402 "
+        "because Docker Spaces need PRO) — the code still lands in the repo.",
+    )
     args = p.parse_args()
 
     if not args.token:
@@ -46,13 +53,14 @@ def main() -> None:
     from huggingface_hub import HfApi  # imported here so --help works without the dep
 
     api = HfApi(token=args.token)
-    api.create_repo(
-        repo_id=args.repo_id,
-        repo_type="space",
-        space_sdk="docker",
-        private=args.private,
-        exist_ok=True,
-    )
+    if not args.skip_create:
+        api.create_repo(
+            repo_id=args.repo_id,
+            repo_type="space",
+            space_sdk="docker",
+            private=args.private,
+            exist_ok=True,
+        )
 
     with tempfile.TemporaryDirectory() as staging:
         stage(staging)
