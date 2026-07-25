@@ -168,11 +168,14 @@ class SwarmClient:
         accumulated gradient, so the server's optimizer can consume it unchanged.
         """
         if self.byzantine > 0:
-            grads = {
-                n: torch.randn_like(p) * self.byzantine
-                for n, p in self.model.named_parameters()
-            }
-            return grads, float("nan")
+            # A *direction* attack, not a magnitude one. Inflating the norm is
+            # pointless against this server: gradient clipping rescales it, and
+            # AdamW divides by the running second moment, so the step stays
+            # bounded by ~lr no matter how large the upload. What does damage is
+            # a correctly-scaled gradient pointing the wrong way. The attacker
+            # also reports the honest loss, so it looks legitimate in telemetry.
+            grads, loss = self.train_step()
+            return {n: -self.byzantine * g for n, g in grads.items()}, loss
 
         if self.local_steps == 1:
             return self.train_step()

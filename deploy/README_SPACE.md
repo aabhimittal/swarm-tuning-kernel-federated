@@ -47,8 +47,10 @@ sample text from the model as it trains.
 | `SWARM_TOKEN`             | _empty_ | if set, `/gradients` requires a bearer token  |
 
 **Running an open swarm?** Set `SWARM_AGG_RULE` to `trimmed_mean` or `median`.
-With the default `mean`, a single worker uploading one huge tensor destroys the
-global model — averaging has a breakdown point of zero.
+`SWARM_GRAD_CLIP` already bounds how *large* any single update can be, but it
+cannot tell a helpful direction from a hostile one — a minority pushing modest,
+correctly-scaled but reversed gradients will still steer the global model.
+Coordinate-wise rules decide each entry by majority instead.
 
 Set `SWARM_TOKEN` as a **secret** to stop random internet traffic from poisoning
 your global model. Gradients are transported as **safetensors**, so uploads can

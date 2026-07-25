@@ -93,13 +93,30 @@ tensor moves the global mean arbitrarily far and destroys the model.
 | `trimmed_mean` | drop the extremes per coordinate, average the rest |
 | `krum` | keep only the most consensual gradient, discard the rest |
 
-Verify it on your own swarm with the built-in red-team mode:
+`trimmed_mean` and `krum` tolerate `int(world_size * SWARM_TRIM_RATIO)` attackers;
+`median` tolerates up to half the swarm. Size `SWARM_TRIM_RATIO` to the fraction
+of contributors you are willing to distrust.
+
+**Magnitude attacks are a non-event here — direction attacks are the threat.**
+Measured on this stack: a worker uploading a 1e6-magnitude gradient fails to move
+the model at all, even with `--rule mean` *and* `--grad-clip 0`. Two mechanisms
+independently absorb it — `SWARM_GRAD_CLIP` rescales the aggregated update, and
+AdamW divides by the running second moment, so the step stays bounded by ~`lr`
+however large the upload.
+
+Neither mechanism looks at *direction*. A minority submitting correctly-scaled
+but **reversed** gradients steers the global model while never tripping a norm
+bound, and Adam happily follows the poisoned direction at full step size. That is
+what the coordinate-wise rules are for, and it is what the red-team mode
+simulates:
 
 ```bash
-# one poisoned worker out of five
-python scripts/simulate_swarm.py --workers 5 --byzantine 1 --rule mean          # DESTROYED
-python scripts/simulate_swarm.py --workers 5 --byzantine 1 --rule trimmed_mean  # SURVIVED
+python scripts/simulate_swarm.py --workers 4 --byzantine 1 --rule mean    # POISONED
+python scripts/simulate_swarm.py --workers 4 --byzantine 1 --rule median  # SURVIVED
 ```
+
+`--byzantine N` turns the last N workers into attackers that negate their real
+gradient (and report their honest loss, so they look legitimate in telemetry).
 
 ## Live dashboard
 

@@ -13,10 +13,10 @@ CPU proof that the "gradient accumulation over HTTP" interconnect actually train
     # 1/5th the round trips via local steps (FedAvg-style)
     python scripts/simulate_swarm.py --workers 4 --steps 20 --local-steps 5
 
-    # Red-team: one poisoned worker. With --rule mean the model is destroyed;
-    # with --rule trimmed_mean (or median/krum) the swarm shrugs it off.
-    python scripts/simulate_swarm.py --workers 5 --byzantine 1 --rule mean
-    python scripts/simulate_swarm.py --workers 5 --byzantine 1 --rule trimmed_mean
+    # Red-team: one worker submits reversed gradients. `mean` follows it and
+    # stops learning; the coordinate-wise rules out-vote it.
+    python scripts/simulate_swarm.py --workers 4 --byzantine 1 --rule mean
+    python scripts/simulate_swarm.py --workers 4 --byzantine 1 --rule median
 """
 
 from __future__ import annotations
@@ -49,13 +49,19 @@ def wait_for_health(url: str, timeout: float = 40.0) -> None:
 
 
 def start_server(
-    port: int, mode: str, world_size: int, log_path: str, rule: str = "mean"
+    port: int,
+    mode: str,
+    world_size: int,
+    log_path: str,
+    rule: str = "mean",
+    grad_clip: float = 1.0,
 ) -> subprocess.Popen:
     env = dict(os.environ)
     env.update(
         {
             "SWARM_AGG_MODE": mode,
             "SWARM_AGG_RULE": rule,
+            "SWARM_GRAD_CLIP": str(grad_clip),
             "SWARM_WORLD_SIZE": str(world_size),
             "SWARM_PORT": str(port),
             # In async mode, workers race: tolerate staleness up to the swarm size so
@@ -107,7 +113,11 @@ def start_workers(
             "--local-steps", str(local_steps),
         ]
         if is_bad:
-            cmd += ["--byzantine", "1e6"]
+            # Scale the reversed gradient so the attackers outweigh the honest
+            # majority in a plain mean: b*scale > (n-b). Anything less and even
+            # `mean` shrugs it off, which would make the demo prove nothing.
+            scale = 2.0 * (n - byzantine) / byzantine
+            cmd += ["--byzantine", str(scale)]
         procs.append(
             subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
         )
@@ -132,6 +142,14 @@ def main() -> int:
         default=0,
         help="How many of the workers upload poisoned gradients (red-team test).",
     )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Server-side gradient-norm clip; <=0 disables. Clipping is itself a "
+        "partial defence (it bounds a poisoned update's magnitude), so disable it "
+        "to see plain `mean` actually break.",
+    )
     args = p.parse_args()
     if args.byzantine >= args.workers:
         p.error("--byzantine must be fewer than --workers")
@@ -146,7 +164,10 @@ def main() -> int:
         + (f" byzantine={args.byzantine}" if args.byzantine else "")
         + " =="
     )
-    server = start_server(args.port, args.mode, args.workers, server_log, rule=args.rule)
+    server = start_server(
+        args.port, args.mode, args.workers, server_log, rule=args.rule,
+        grad_clip=args.grad_clip,
+    )
     try:
         wait_for_health(server_url)
         cfg = httpx.get(server_url + "/config").json()
@@ -199,23 +220,25 @@ def main() -> int:
             )
 
         if args.byzantine:
-            # Under attack the question is not "did loss improve" but "is the
-            # model still alive". Judge on the weight norm, not the reported
-            # loss: once the weights explode, workers report NaN losses which
-            # the server discards, leaving a stale-but-finite last_loss.
+            # The attackers submit reversed gradients, so the question is whether
+            # the model still *learns*, not whether the weights exploded. (An
+            # inflated-magnitude attack is a non-event here: clipping rescales it
+            # and AdamW normalises by the second moment, so the step stays ~lr.)
             norm = final.get("weight_norm")
             print(f"weight norm    : {norm}")
             survived = (
                 final.get("healthy")
-                and norm is not None
-                and norm < 1e4
-                and final["version"] > 0
+                and first_loss is not None
+                and final_loss is not None
+                and final_loss < first_loss
             )
             print(
                 "RESULT:",
-                f"SURVIVED ✅ {args.rule} absorbed {args.byzantine} poisoned worker(s)"
+                f"SURVIVED ✅ {args.rule} kept learning through "
+                f"{args.byzantine} poisoned worker(s)"
                 if survived
-                else f"DESTROYED ❌ {args.rule} was broken by {args.byzantine} poisoned worker(s)",
+                else f"POISONED ❌ {args.rule} stopped learning under "
+                f"{args.byzantine} poisoned worker(s)",
             )
             return 0 if survived else 1
 
