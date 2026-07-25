@@ -6,11 +6,23 @@ CPU proof that the "gradient accumulation over HTTP" interconnect actually train
 
     python scripts/simulate_swarm.py --workers 4 --steps 60 --mode sync
     python scripts/simulate_swarm.py --workers 4 --steps 80 --mode async
+
+    # 50x less bandwidth via Top-K sparsification with error feedback
+    python scripts/simulate_swarm.py --workers 4 --steps 60 --compression topk
+
+    # 1/5th the round trips via local steps (FedAvg-style)
+    python scripts/simulate_swarm.py --workers 4 --steps 20 --local-steps 5
+
+    # Red-team: one poisoned worker. With --rule mean the model is destroyed;
+    # with --rule trimmed_mean (or median/krum) the swarm shrugs it off.
+    python scripts/simulate_swarm.py --workers 5 --byzantine 1 --rule mean
+    python scripts/simulate_swarm.py --workers 5 --byzantine 1 --rule trimmed_mean
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -36,11 +48,14 @@ def wait_for_health(url: str, timeout: float = 40.0) -> None:
     raise RuntimeError(f"server did not become healthy at {url}: {last_err}")
 
 
-def start_server(port: int, mode: str, world_size: int, log_path: str) -> subprocess.Popen:
+def start_server(
+    port: int, mode: str, world_size: int, log_path: str, rule: str = "mean"
+) -> subprocess.Popen:
     env = dict(os.environ)
     env.update(
         {
             "SWARM_AGG_MODE": mode,
+            "SWARM_AGG_RULE": rule,
             "SWARM_WORLD_SIZE": str(world_size),
             "SWARM_PORT": str(port),
             # In async mode, workers race: tolerate staleness up to the swarm size so
@@ -62,31 +77,39 @@ def start_server(port: int, mode: str, world_size: int, log_path: str) -> subpro
 
 
 def start_workers(
-    server_url: str, n: int, steps: int, batch_size: int, log_dir: str
+    server_url: str,
+    n: int,
+    steps: int,
+    batch_size: int,
+    log_dir: str,
+    compression: str = "none",
+    local_steps: int = 1,
+    byzantine: int = 0,
 ) -> List[subprocess.Popen]:
     procs = []
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     for i in range(n):
+        # The last `byzantine` workers are the attackers.
+        is_bad = i >= n - byzantine
         log = open(os.path.join(log_dir, f"worker_{i}.log"), "w")
+        cmd = [
+            sys.executable, "-m", "worker.run_worker",
+            "--server", server_url,
+            "--worker-id", ("evil" if is_bad else "w") + str(i),
+            "--shard", str(i),
+            "--num-shards", str(n),
+            "--steps", str(steps),
+            "--batch-size", str(batch_size),
+            "--seed", str(1000 + i),
+            "--compression", compression,
+            "--local-steps", str(local_steps),
+        ]
+        if is_bad:
+            cmd += ["--byzantine", "1e6"]
         procs.append(
-            subprocess.Popen(
-                [
-                    sys.executable, "-m", "worker.run_worker",
-                    "--server", server_url,
-                    "--worker-id", f"w{i}",
-                    "--shard", str(i),
-                    "--num-shards", str(n),
-                    "--steps", str(steps),
-                    "--batch-size", str(batch_size),
-                    "--seed", str(1000 + i),
-                ],
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
+            subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
         )
     return procs
 
@@ -98,20 +121,47 @@ def main() -> int:
     p.add_argument("--mode", choices=["sync", "async"], default="sync")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument(
+        "--rule", choices=["mean", "median", "trimmed_mean", "krum"], default="mean"
+    )
+    p.add_argument("--compression", choices=["none", "topk", "topk-int8"], default="none")
+    p.add_argument("--local-steps", type=int, default=1)
+    p.add_argument(
+        "--byzantine",
+        type=int,
+        default=0,
+        help="How many of the workers upload poisoned gradients (red-team test).",
+    )
     args = p.parse_args()
+    if args.byzantine >= args.workers:
+        p.error("--byzantine must be fewer than --workers")
 
     server_url = f"http://localhost:{args.port}"
     os.makedirs("/tmp/swarm_logs", exist_ok=True)
     server_log = "/tmp/swarm_logs/server.log"
 
-    print(f"== Swarm simulation: mode={args.mode} workers={args.workers} steps={args.steps} ==")
-    server = start_server(args.port, args.mode, args.workers, server_log)
+    print(
+        f"== Swarm simulation: mode={args.mode} rule={args.rule} workers={args.workers} "
+        f"steps={args.steps} compression={args.compression} local_steps={args.local_steps}"
+        + (f" byzantine={args.byzantine}" if args.byzantine else "")
+        + " =="
+    )
+    server = start_server(args.port, args.mode, args.workers, server_log, rule=args.rule)
     try:
         wait_for_health(server_url)
         cfg = httpx.get(server_url + "/config").json()
-        print(f"server up | model={cfg['model']} | mode={cfg['mode']}")
+        print(f"server up | model={cfg['model']} | mode={cfg['mode']} | rule={cfg['rule']}")
 
-        workers = start_workers(server_url, args.workers, args.steps, args.batch_size, "/tmp/swarm_logs")
+        workers = start_workers(
+            server_url,
+            args.workers,
+            args.steps,
+            args.batch_size,
+            "/tmp/swarm_logs",
+            compression=args.compression,
+            local_steps=args.local_steps,
+            byzantine=args.byzantine,
+        )
 
         history = []  # (version, last_loss)
         first_loss = None
@@ -134,11 +184,40 @@ def main() -> int:
 
         final = httpx.get(server_url + "/status").json()
         final_loss = final.get("last_loss")
+        summary = httpx.get(server_url + "/workers").json().get("summary", {})
+
         print("\n== Result ==")
         print(f"global version : {final['version']}")
         print(f"optimizer steps: {final['step']}")
         print(f"first loss     : {first_loss}")
         print(f"final loss     : {final_loss}")
+        if args.compression != "none":
+            print(
+                f"bandwidth      : {summary.get('wire_bytes', 0):,} B sent vs "
+                f"{summary.get('dense_bytes', 0):,} B dense "
+                f"({summary.get('compression_ratio', 1)}x smaller)"
+            )
+
+        if args.byzantine:
+            # Under attack the question is not "did loss improve" but "is the
+            # model still alive". Judge on the weight norm, not the reported
+            # loss: once the weights explode, workers report NaN losses which
+            # the server discards, leaving a stale-but-finite last_loss.
+            norm = final.get("weight_norm")
+            print(f"weight norm    : {norm}")
+            survived = (
+                final.get("healthy")
+                and norm is not None
+                and norm < 1e4
+                and final["version"] > 0
+            )
+            print(
+                "RESULT:",
+                f"SURVIVED ✅ {args.rule} absorbed {args.byzantine} poisoned worker(s)"
+                if survived
+                else f"DESTROYED ❌ {args.rule} was broken by {args.byzantine} poisoned worker(s)",
+            )
+            return 0 if survived else 1
 
         ok = (
             first_loss is not None

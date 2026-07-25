@@ -10,10 +10,12 @@ from tests.conftest import const_grads, make_state, zero_grads
 
 
 def test_average_is_elementwise_mean():
+    from server import robust
+
     state = make_state()
     a = const_grads(state, 2.0)
     b = const_grads(state, 4.0)
-    avg = GradientAggregator._average([a, b])
+    avg = robust.aggregate([a, b], rule="mean")
     for k in a:
         assert torch.allclose(avg[k], torch.full_like(avg[k], 3.0))
 

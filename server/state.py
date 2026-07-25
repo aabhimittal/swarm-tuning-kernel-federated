@@ -29,6 +29,18 @@ class GlobalState:
         self.step: int = 0
         self.last_loss = None  # Optional[float]; None until the first step
         self._param_names = [n for n, _ in self.model.named_parameters()]
+        # Set by bootstrap(); enables /generate. None when built directly (tests).
+        self.tokenizer = None
+
+    @property
+    def param_shapes(self):
+        """{name: shape} used to rebuild dense gradients from sparse uploads."""
+        return {n: p.shape for n, p in self.model.named_parameters()}
+
+    @property
+    def dense_gradient_bytes(self) -> int:
+        """Wire size an *uncompressed* gradient upload would cost, for accounting."""
+        return sum(p.numel() * p.element_size() for p in self.model.parameters())
 
     @classmethod
     def bootstrap(cls, model_cfg: ModelConfig, swarm_cfg: SwarmConfig) -> "GlobalState":
@@ -36,6 +48,7 @@ class GlobalState:
         ds = build_dataset(block_size=model_cfg.block_size)
         cfg = model_cfg.with_vocab(ds.vocab_size)
         state = cls(cfg, swarm_cfg)
+        state.tokenizer = ds.tokenizer
         if swarm_cfg.checkpoint_path and os.path.exists(swarm_cfg.checkpoint_path):
             state.load_checkpoint(swarm_cfg.checkpoint_path)
         return state

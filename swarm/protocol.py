@@ -25,12 +25,20 @@ EP_WEIGHTS = "/weights"
 EP_GRADIENTS = "/gradients"
 EP_STATUS = "/status"
 EP_CHECKPOINT = "/checkpoint"
+EP_WORKERS = "/workers"
+EP_HISTORY = "/history"
+EP_GENERATE = "/generate"
+EP_DASHBOARD = "/"
 
 # ---- Headers ----
 H_MODEL_VERSION = "X-Model-Version"
 H_WORKER_ID = "X-Worker-Id"
 H_LOSS = "X-Loss"
 H_AUTH = "Authorization"
+# Compression scheme used for a /gradients payload: none | topk | topk-int8.
+H_COMPRESSION = "X-Compression"
+# Number of local optimizer steps behind this update (1 = plain FedSGD).
+H_LOCAL_STEPS = "X-Local-Steps"
 
 CONTENT_TYPE = "application/octet-stream"
 

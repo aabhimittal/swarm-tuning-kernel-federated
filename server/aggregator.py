@@ -16,12 +16,14 @@ workers are serialized and can never corrupt the weights.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from server import robust
 from server.state import GlobalState
 
 
@@ -82,15 +84,32 @@ class GradientAggregator:
 
     def status(self) -> dict:
         with self._lock:
+            norm = self._weight_norm_locked()
             return {
                 "mode": self.cfg.mode,
+                "rule": self.cfg.rule,
                 "version": self.state.version,
                 "step": self.state.step,
                 "pending": len(self._buffer),
                 "world_size": self.cfg.world_size,
                 "last_loss": self.state.last_loss,
                 "num_params": self.state.model.num_params(),
+                # L2 norm of all weights. The honest liveness signal: a poisoned
+                # update blows this up or turns it NaN long before the reported
+                # loss reflects it. None means the model has diverged.
+                "weight_norm": norm,
+                "healthy": norm is not None,
             }
+
+    def _weight_norm_locked(self) -> Optional[float]:
+        with torch.no_grad():
+            total = 0.0
+            for p in self.state.model.parameters():
+                total += float(p.detach().float().pow(2).sum())
+                if not math.isfinite(total):
+                    return None
+        norm = math.sqrt(total)
+        return norm if math.isfinite(norm) else None
 
     # ---- sync ---------------------------------------------------------------
     def _submit_sync(
@@ -110,12 +129,9 @@ class GradientAggregator:
                 last_loss=self.state.last_loss,
             )
 
-        averaged = self._average(self._buffer)
-        mean_loss = (
-            sum(self._buffer_losses) / len(self._buffer_losses)
-            if self._buffer_losses
-            else None
-        )
+        averaged = robust.aggregate(self._buffer, self.cfg.rule, self.cfg.trim_ratio)
+        finite = [l for l in self._buffer_losses if math.isfinite(l)]
+        mean_loss = sum(finite) / len(finite) if finite else None
         self._apply_and_step(averaged, mean_loss)
         self._buffer.clear()
         self._buffer_losses.clear()
@@ -161,7 +177,9 @@ class GradientAggregator:
         opt.zero_grad(set_to_none=True)
         self.state.version += 1
         self.state.step += 1
-        if loss is not None:
+        # A hostile or broken worker can report NaN/inf. Never let that reach the
+        # state: it is not JSON-representable and would 500 /status for everyone.
+        if loss is not None and math.isfinite(loss):
             self.state.last_loss = float(loss)
         self._maybe_checkpoint()
 
@@ -175,18 +193,6 @@ class GradientAggregator:
                 pass
 
     # ---- helpers ------------------------------------------------------------
-    @staticmethod
-    def _average(buffer: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        n = len(buffer)
-        keys = buffer[0].keys()
-        out: Dict[str, torch.Tensor] = {}
-        for k in keys:
-            acc = buffer[0][k].clone()
-            for d in buffer[1:]:
-                acc += d[k]
-            out[k] = acc / n
-        return out
-
     def _validate_keys(self, grads: Dict[str, torch.Tensor]) -> None:
         keys = set(grads.keys())
         if keys != self._expected_keys:
