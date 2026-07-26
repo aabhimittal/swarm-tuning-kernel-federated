@@ -1,10 +1,17 @@
 """Byzantine-robust aggregation rules — the trust kernel.
 
-A swarm is open by construction: anyone holding the token can push gradients.
-Plain averaging has a breakdown point of *zero* — one worker sending a single
-huge tensor drags the global mean arbitrarily far and destroys the model. That
-is a real threat here, not a theoretical one, because the parameter server is a
-public URL.
+A swarm is open by construction: anyone holding the token can push gradients, and
+the parameter server is a public URL. Plain averaging has a breakdown point of
+*zero* — a single worker can drag the global mean arbitrarily far.
+
+What that buys an attacker depends on which property they manipulate. Inflating
+the *magnitude* is wasted effort against this server: gradient clipping rescales
+the aggregate, and AdamW divides by the running second moment, so the step stays
+bounded by ~lr however large the upload (measured: a 1e6 gradient left the weight
+norm at 38.387 vs 38.381 healthy, even with clipping disabled). Neither mechanism
+inspects *direction* — a minority submitting correctly-scaled but reversed
+gradients steers the model at full step size while tripping no norm bound. That
+is the attack these rules actually defend against.
 
 These rules trade a little statistical efficiency for a non-zero breakdown point:
 

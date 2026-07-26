@@ -83,8 +83,9 @@ python scripts/simulate_swarm.py --workers 4 --steps 20 --local-steps 5
 ### 3. Trust — `server/robust.py`
 
 The parameter server is a public URL, so anyone with the token can push. Plain
-averaging has a **breakdown point of zero**: one worker sending a single huge
-tensor moves the global mean arbitrarily far and destroys the model.
+averaging has a **breakdown point of zero** in theory: a single worker can move
+the global mean arbitrarily far. In practice the damage depends entirely on
+*which* property the attacker manipulates — see the measured result below.
 
 | `SWARM_AGG_RULE` | Behaviour |
 |---|---|

@@ -13,8 +13,15 @@ def poisoned(value=1e6):
     return {"w": torch.full((8,), value)}
 
 
-def test_mean_is_destroyed_by_a_single_poisoned_worker():
-    """Motivates the other rules: plain averaging has zero breakdown point."""
+def test_mean_has_zero_breakdown_point_at_the_aggregation_layer():
+    """Plain averaging lets one worker dominate the aggregate.
+
+    This is a property of the *rule alone*. Downstream, gradient clipping and
+    AdamW's second-moment normalisation both bound the resulting step, so this
+    magnitude attack does not actually move the model — see
+    test_robust_rules_stop_sign_flip_attacks_that_clipping_cannot for the attack
+    that survives those defences.
+    """
     buf = honest(1.0, 4) + [poisoned()]
     out = robust.aggregate(buf, rule="mean")
     assert out["w"].abs().max() > 1000  # one attacker dominated the update
