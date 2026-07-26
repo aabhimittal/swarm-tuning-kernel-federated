@@ -1,12 +1,22 @@
 """SwarmClient — the Kaggle/worker side of the software interconnect.
 
-The loop is deliberately tiny:
+The base loop is deliberately tiny:
 
     pull weights  ->  train on one micro-batch  ->  push only the gradients
 
-The worker never holds an optimizer or a second copy of the model, so its peak
-memory is one model + one batch. That's why a swarm of free instances can
-collectively fine-tune a model bigger than any one of them could *train* alone.
+Two options change the communication/computation trade-off:
+
+* ``compression`` — Top-K sparsify the gradient (with error feedback) before
+  upload, cutting the payload by 50x or more. See :mod:`swarm.compression`.
+* ``local_steps`` — run N local optimizer steps and upload the *accumulated
+  parameter delta* instead of a single-batch gradient. The server feeds that
+  delta to its own optimizer, which is exactly FedAvg-with-a-server-optimizer
+  ("FedOpt", Reddi et al. 2021). N local steps means 1/N as many round trips,
+  which matters far more than FLOPs when the interconnect is HTTP.
+
+The worker never holds an optimizer state for the *global* model and never a
+second replica, so its peak memory is one model + one batch. That is why a swarm
+of free instances can collectively train a model none of them could train alone.
 """
 
 from __future__ import annotations
@@ -17,6 +27,7 @@ from typing import Dict, Optional, Tuple
 import httpx
 import torch
 
+from swarm import compression as C
 from swarm import protocol as P
 from swarm.config import ModelConfig
 from swarm.data import build_dataset
@@ -25,7 +36,7 @@ from swarm.model import TinyGPT, build_model
 
 @dataclass
 class PushOutcome:
-    ok: bool          # True if the server applied/accepted the gradient
+    ok: bool          # True if the server accepted the gradient
     stale: bool       # True if rejected as stale (caller should re-pull)
     status_code: int
     body: dict
@@ -42,11 +53,31 @@ class SwarmClient:
         token: str = "",
         timeout: float = 60.0,
         seed: Optional[int] = None,
+        compression: str = C.NONE,
+        compress_ratio: float = 0.01,
+        local_steps: int = 1,
+        local_lr: float = 1e-3,
+        byzantine: float = 0.0,
     ):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id
         self.batch_size = batch_size
         self.token = token
+        self.local_steps = max(int(local_steps), 1)
+        self.local_lr = local_lr
+        # Red-team switch: when > 0 this worker uploads garbage of that magnitude
+        # instead of a real gradient. Exists so you can verify your own swarm's
+        # Byzantine-robust aggregation actually holds (see scripts/simulate_swarm.py
+        # --byzantine). With rule="mean" one such worker destroys the model.
+        self.byzantine = float(byzantine)
+        if compression not in C.MODES:
+            raise ValueError(f"compression must be one of {C.MODES}, got {compression!r}")
+        self.compression = compression
+        self.compress_ratio = compress_ratio
+        # Error-feedback buffer: gradient mass dropped by Top-K, carried forward.
+        self._residual: Dict[str, torch.Tensor] = {}
+        self.last_ratio: float = 1.0
+
         self._http = httpx.Client(timeout=timeout)
         self._gen = torch.Generator()
         if seed is not None:
@@ -91,12 +122,24 @@ class SwarmClient:
         return self.version
 
     def push(self, grads: Dict[str, torch.Tensor], loss: float) -> PushOutcome:
-        body = P.serialize_tensors(grads)
+        wire = grads
+        if self.compression != C.NONE:
+            wire = C.compress(
+                grads,
+                mode=self.compression,
+                ratio=self.compress_ratio,
+                residual=self._residual,
+            )
+            _, _, self.last_ratio = C.compression_report(grads, wire)
+
+        body = P.serialize_tensors(wire)
         headers = self._headers(
             {
                 P.H_MODEL_VERSION: str(self.version),
                 P.H_LOSS: f"{loss:.6f}",
                 P.H_WORKER_ID: self.worker_id,
+                P.H_COMPRESSION: self.compression,
+                P.H_LOCAL_STEPS: str(self.local_steps),
                 "Content-Type": P.CONTENT_TYPE,
             }
         )
@@ -115,24 +158,62 @@ class SwarmClient:
         _, loss = self.model(x, y)
         loss.backward()
         grads = {n: p.grad.detach().clone() for n, p in self.model.named_parameters()}
-        return grads, float(loss.item())
+        return grads, loss.item()
+
+    def train_local(self) -> Tuple[Dict[str, torch.Tensor], float]:
+        """Run ``local_steps`` local SGD steps; return the parameter delta as a
+        pseudo-gradient plus the mean local loss.
+
+        ``delta = theta_start - theta_end`` points in the same direction as an
+        accumulated gradient, so the server's optimizer can consume it unchanged.
+        """
+        if self.byzantine > 0:
+            # A *direction* attack, not a magnitude one. Inflating the norm is
+            # pointless against this server: gradient clipping rescales it, and
+            # AdamW divides by the running second moment, so the step stays
+            # bounded by ~lr no matter how large the upload. What does damage is
+            # a correctly-scaled gradient pointing the wrong way. The attacker
+            # also reports the honest loss, so it looks legitimate in telemetry.
+            grads, loss = self.train_step()
+            return {n: -self.byzantine * g for n, g in grads.items()}, loss
+
+        if self.local_steps == 1:
+            return self.train_step()
+
+        start = {n: p.detach().clone() for n, p in self.model.named_parameters()}
+        opt = torch.optim.SGD(self.model.parameters(), lr=self.local_lr)
+        self.model.train()
+        total = 0.0
+        for _ in range(self.local_steps):
+            opt.zero_grad(set_to_none=True)
+            x, y = self.dataset.get_batch(self.batch_size, generator=self._gen)
+            _, loss = self.model(x, y)
+            loss.backward()
+            opt.step()
+            total += loss.item()
+
+        delta = {
+            n: (start[n] - p.detach()) for n, p in self.model.named_parameters()
+        }
+        return delta, total / self.local_steps
 
     def run(self, steps: int, verbose: bool = True) -> None:
         """Full worker loop: (pull -> train -> push) x steps, re-pulling on staleness."""
         for i in range(steps):
             self.pull()
-            grads, loss = self.train_step()
+            grads, loss = self.train_local()
             outcome = self.push(grads, loss)
             if outcome.stale:
                 if verbose:
-                    print(f"[{self.worker_id}] step {i}: stale, re-pulling")
+                    print(f"[{self.worker_id}] round {i}: stale, re-pulling")
                 continue
             if verbose:
                 b = outcome.body
                 tag = "STEP" if b.get("applied") else "buffered"
+                extra = f" comp={self.last_ratio:.0f}x" if self.compression != C.NONE else ""
                 print(
-                    f"[{self.worker_id}] iter {i}: loss={loss:.4f} -> {tag} "
-                    f"v={b.get('version')} pending={b.get('pending')}"
+                    f"[{self.worker_id}] round {i}: loss={loss:.4f} -> {tag} "
+                    f"v={b.get('version')} pending={b.get('pending')}{extra}"
                 )
 
     def close(self) -> None:

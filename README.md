@@ -38,13 +38,97 @@ gradient producers.
 
 | Path | What it is |
 |------|------------|
-| `swarm/` | shared core imported by **both** sides: `model.py` (TinyGPT), `data.py`, `protocol.py` (safetensors wire format), `config.py` |
-| `server/` | parameter server: `app.py` (FastAPI), `aggregator.py` (sync/async averaging), `state.py` |
+| `swarm/` | shared core imported by **both** sides: `model.py` (TinyGPT), `data.py`, `protocol.py` (safetensors wire format), `compression.py` (Top-K + error feedback), `config.py` |
+| `server/` | parameter server: `app.py` (FastAPI), `aggregator.py` (sync/async), `robust.py` (Byzantine-robust rules), `telemetry.py`, `dashboard.py`, `state.py` |
 | `worker/` | `client.py` (`SwarmClient`) + `run_worker.py` (CLI) |
 | `scripts/simulate_swarm.py` | local end-to-end proof: 1 server + N workers on this box |
 | `deploy/` | `Dockerfile`, HF Space card, `deploy_hf_space.py` (one-command deploy) |
 | `notebooks/kaggle_worker.ipynb` | ready-to-run Kaggle worker |
-| `tests/` | unit tests for the protocol and the aggregator |
+| `tests/` | protocol, compression, robustness, aggregator, and full-stack API tests |
+
+## The three bottlenecks of an HTTP interconnect
+
+Replacing NVLink with HTTP creates three problems a GPU cluster never has. Each
+gets a dedicated piece of the kernel.
+
+### 1. Bandwidth — `swarm/compression.py`
+
+NVLink moves ~600 GB/s; a free Kaggle box moves maybe 10 MB/s. Uploading a dense
+gradient every step means the worker is ~97% idle waiting on the network.
+
+* **Top-K sparsification** sends only the largest-magnitude `--compress-ratio`
+  fraction of entries (default 1%) as index/value pairs.
+* **Error feedback** keeps everything that was *not* sent in a local residual and
+  folds it into the next step, so a small persistent gradient accumulates until
+  it is big enough to transmit. This is what makes aggressive sparsification
+  safe; the delivered mass satisfies `sum(sent) == n·grad − residual` exactly.
+* **int8 quantization** (`--compression topk-int8`) shrinks the surviving values
+  another ~4x with a per-tensor scale.
+
+```bash
+python scripts/simulate_swarm.py --workers 4 --steps 60 --compression topk
+```
+
+### 2. Latency — local steps (FedAvg / FedOpt)
+
+A round trip to a Space costs far more than a forward/backward pass. `--local-steps N`
+runs N local SGD steps and uploads the accumulated **parameter delta** as a
+pseudo-gradient, which the server feeds to its own AdamW. That is FedAvg with a
+server optimizer, and it cuts round trips by N×.
+
+```bash
+python scripts/simulate_swarm.py --workers 4 --steps 20 --local-steps 5
+```
+
+### 3. Trust — `server/robust.py`
+
+The parameter server is a public URL, so anyone with the token can push. Plain
+averaging has a **breakdown point of zero** in theory: a single worker can move
+the global mean arbitrarily far. In practice the damage depends entirely on
+*which* property the attacker manipulates — see the measured result below.
+
+| `SWARM_AGG_RULE` | Behaviour |
+|---|---|
+| `mean` | standard accumulation — fastest, zero robustness |
+| `median` | coordinate-wise median; tolerates <50% attackers |
+| `trimmed_mean` | drop the extremes per coordinate, average the rest |
+| `krum` | keep only the most consensual gradient, discard the rest |
+
+`trimmed_mean` and `krum` tolerate `int(world_size * SWARM_TRIM_RATIO)` attackers;
+`median` tolerates up to half the swarm. Size `SWARM_TRIM_RATIO` to the fraction
+of contributors you are willing to distrust.
+
+**Magnitude attacks are a non-event here — direction attacks are the threat.**
+Measured on this stack: a worker uploading a 1e6-magnitude gradient fails to move
+the model at all, even with `--rule mean` *and* `--grad-clip 0`. Two mechanisms
+independently absorb it — `SWARM_GRAD_CLIP` rescales the aggregated update, and
+AdamW divides by the running second moment, so the step stays bounded by ~`lr`
+however large the upload.
+
+Neither mechanism looks at *direction*. A minority submitting correctly-scaled
+but **reversed** gradients steers the global model while never tripping a norm
+bound, and Adam happily follows the poisoned direction at full step size. That is
+what the coordinate-wise rules are for, and it is what the red-team mode
+simulates:
+
+```bash
+python scripts/simulate_swarm.py --workers 4 --byzantine 1 --rule mean    # POISONED
+python scripts/simulate_swarm.py --workers 4 --byzantine 1 --rule median  # SURVIVED
+```
+
+`--byzantine N` turns the last N workers into attackers that negate their real
+gradient (and report their honest loss, so they look legitimate in telemetry).
+
+## Live dashboard
+
+The Space serves a self-contained dashboard at `/` — global loss curve, the
+contributor leaderboard, bandwidth saved by compression, model health, and a box
+to sample text from the current global model. No CDN, no build step.
+
+Extra endpoints behind it: `/workers` (per-worker ledger), `/history` (loss
+series), `/generate?prompt=…&tokens=…` (sample the global model). `/status` also
+reports `weight_norm` and `healthy`, which is the honest liveness signal — a
+poisoned update explodes the norm long before the reported loss reflects it.
 
 ## Quickstart (local, CPU)
 
